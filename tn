@@ -1,0 +1,640 @@
+#!/usr/bin/env python3
+"""tn - list and run TechNexion (or any V4L2 sensor) cameras without media-ctl by hand.
+
+  tn                                      show every camera, largest size, top fps
+  tn ls                                   cameras, their path and every size/fps
+  tn cam0 1920x1080 60 cam1 3840x2160 15  set up and show on screen with live fps
+  tn set  cam0 1920x1080 60 ...           set up only, print the video nodes
+
+Size and fps are optional (default: largest size, highest fps of that size).
+Add "fps" after a camera (e.g. cam0 1920x1080 60 fps) to use a short manual exposure
+that keeps the top fps in dim light.
+Needs media-ctl, v4l2-ctl and, for show, GStreamer with Python bindings.
+"""
+import glob
+import os
+import re
+import subprocess
+import sys
+import time
+
+# ---------------------------------------------------------------- board quirks
+# Entities never used as part of a camera path (raw ISP front ends etc.).
+SKIP_ENTITY = re.compile(r"^(pisp-fe|rp1-cfe-fe-)")
+# Order in which free video nodes are picked (lower first); default is name order.
+NODE_ORDER = {"rp1-cfe-csi2-ch0": 0, "rp1-cfe-csi2-ch2": 1, "rp1-cfe-csi2-ch3": 2,
+              "rp1-cfe-csi2-ch1": 3}
+# Max data rate one receiver (media device driver) takes, in Gbit/s. Not reported by
+# the kernel, so it is a table: lanes x per-lane rate.
+RECEIVER_GBPS = {"rp1-cfe": 4 * 1.5}
+
+# media bus code name -> (code, V4L2 pixel format, bits per pixel)
+MBUS = {
+    "UYVY8_1X16": (0x200F, "UYVY", 16), "YUYV8_1X16": (0x2011, "YUYV", 16),
+    "VYUY8_1X16": (0x2010, "VYUY", 16), "YVYU8_1X16": (0x2012, "YVYU", 16),
+    "UYVY8_2X8": (0x2006, "UYVY", 16), "YUYV8_2X8": (0x2008, "YUYV", 16),
+    "RGB888_1X24": (0x100A, "RGB3", 24),
+}
+
+
+def run(cmd, check=False):
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if check and p.returncode:
+        raise RuntimeError(" ".join(cmd) + "\n" + p.stdout)
+    return p.returncode, p.stdout
+
+
+def die(msg):
+    print("tn: " + msg, file=sys.stderr)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------- media graph
+class Pad:
+    def __init__(self, ent, idx, source):
+        self.ent, self.idx, self.source = ent, idx, source
+        self.links = []          # [(remote entity name, remote pad, flags)]
+        self.fmt = None          # e.g. "UYVY8_1X16"
+
+
+class Entity:
+    def __init__(self, media, name, nroutes):
+        self.media, self.name = media, name
+        self.routing = nroutes is not None and nroutes > 0
+        self.subdev = False
+        self.sensor = False
+        self.node = None         # /dev/videoN or /dev/v4l-subdevN
+        self.video = False       # capture video node
+        self.pads = {}
+        self.routes = {}         # sink pad -> {source pads} of the active routes
+
+    def __repr__(self):
+        return self.name
+
+
+class Media:
+    def __init__(self, dev):
+        self.dev = dev
+        self.driver = ""
+        self.ents = {}
+        rc, out = run(["media-ctl", "-d", dev, "-p"])
+        if rc:
+            return
+        m = re.search(r"^driver\s+(\S+)", out, re.M)
+        self.driver = m.group(1) if m else ""
+        ent = pad = None
+        for line in out.splitlines():
+            m = re.match(r"- entity \d+: (.+) \(\d+ pads?, \d+ links?(?:, (\d+) routes?)?\)", line)
+            if m:
+                ent = Entity(self, m.group(1), int(m.group(2)) if m.group(2) else None)
+                self.ents[ent.name] = ent
+                pad = None
+                continue
+            if ent is None:
+                continue
+            s = line.strip()
+            if s.startswith("type "):
+                ent.subdev = "V4L2 subdev" in s
+                ent.sensor = "subtype Sensor" in s
+                ent.video = s.startswith("type Node subtype V4L")
+            elif pad is None and re.match(r"\d+/\d+ -> \d+/\d+ \[.*ACTIVE", s):
+                a, b = re.match(r"(\d+)/\d+ -> (\d+)/", s).groups()
+                ent.routes.setdefault(int(a), set()).add(int(b))
+            elif s.startswith("device node name"):
+                ent.node = s.split()[-1]
+            elif re.match(r"pad\d+:", s):
+                idx = int(re.match(r"pad(\d+):", s).group(1))
+                pad = Pad(ent, idx, "SOURCE" in s.split(":", 1)[1])
+                ent.pads[idx] = pad
+            elif pad and s.startswith("[") and "fmt:" in s and pad.fmt is None:
+                pad.fmt = re.search(r"fmt:([^/\s]+)/", s).group(1)
+            elif pad and (s.startswith("->") or s.startswith("<-")):
+                m = re.match(r'[-<]+>?\s*"(.+)":(\d+)\s*\[(.*)\]', s)
+                if m:
+                    pad.links.append((m.group(1), int(m.group(2)), m.group(3)))
+        # a capture node is a /dev/videoN; some receivers (NXP mxc-mipi-csi2) are
+        # also "type Node" but sit on a /dev/v4l-subdevN
+        for e in self.ents.values():
+            e.video = e.video and bool(e.node) and e.node.startswith("/dev/video")
+
+
+class Graph:
+    """All media devices joined into one graph (a bridge can span two)."""
+
+    def __init__(self):
+        self.medias = [Media(d) for d in sorted(glob.glob("/dev/media*"),
+                                                key=lambda d: int(re.sub(r"\D", "", d)))]
+        self.medias = [m for m in self.medias if m.ents]
+        self.extra = {}  # (entity id) -> [(src pad, remote entity)] virtual links
+        # A bridge with "separate PHY subdevs" registers "<bridge> phyN" in the media
+        # device of the receiver it feeds: it continues the bridge's N-th source pad.
+        for m in self.medias:
+            for e in m.ents.values():
+                mm = re.match(r"(.+) phy(\d+)$", e.name)
+                if not mm:
+                    continue
+                for m2 in self.medias:
+                    b = m2.ents.get(mm.group(1))
+                    if b and m2 is not m:
+                        srcs = sorted(p.idx for p in b.pads.values() if p.source)
+                        n = int(mm.group(2))
+                        if n < len(srcs):
+                            self.extra.setdefault(id(b), []).append((srcs[n], e))
+
+    def cameras(self):
+        cams = [e for m in self.medias for e in m.ents.values() if e.sensor]
+        key = lambda e: [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", e.name)]
+        return sorted(cams, key=key)
+
+    def out_hops(self, ent, pad):
+        """(src pad, remote entity, remote sink pad, flags) leaving ent from source pad."""
+        hops = []
+        for name, rpad, flags in ent.pads[pad].links:
+            r = ent.media.ents.get(name)
+            if r and r.pads.get(rpad) and not r.pads[rpad].source:
+                hops.append((pad, r, rpad, flags))
+        for spad, r in self.extra.get(id(ent), []):
+            if spad == pad:
+                sink = next((p.idx for p in r.pads.values() if not p.source), None)
+                hops.append((pad, r, sink, "VIRTUAL"))
+        return hops
+
+    def paths(self, cam):
+        """All paths camera -> capture video node: [(entity, in pad, out pad)]."""
+        res = []
+
+        def walk(ent, inpad, path, seen):
+            if ent.video:
+                res.append(path + [(ent, inpad, None)])
+                return
+            if SKIP_ENTITY.match(ent.name) or id(ent) in seen:
+                return
+            for p in ent.pads.values():
+                if not p.source:
+                    continue
+                # an entity that keeps fixed routes: follow them
+                if inpad in ent.routes and p.idx not in ent.routes[inpad]:
+                    continue
+                for spad, r, rpad, flags in self.out_hops(ent, p.idx):
+                    walk(r, rpad, path + [(ent, inpad, spad)], seen | {id(ent)})
+
+        walk(cam, None, [], set())
+        return res
+
+
+# ---------------------------------------------------------------- camera modes
+def mbus_of(cam):
+    code = cam.pads[0].fmt if 0 in cam.pads else None
+    if code not in MBUS:
+        die("%s: unsupported bus format %s" % (cam.name, code))
+    return code
+
+
+# capture formats to try when the node can't store the camera's format as is
+# (e.g. NXP ISI converts and only offers YUYV, not UYVY)
+PIX_ALT = {16: ["YUYV", "UYVY", "NV16", "NV12"], 24: ["RGB3", "BGR3"]}
+
+
+# V4L2 fourcc -> GStreamer format name where they differ
+GST_FMT = {"YUYV": "YUY2", "RGB3": "RGB", "BGR3": "BGR"}
+
+
+def pixfmt(node, code):
+    """Pixel format the capture node takes for this bus format."""
+    _, out = run(["v4l2-ctl", "-d", node.node, "--list-formats"])
+    have = re.findall(r"'(\w{3,4}\s?)'", out)
+    have = [h.strip() for h in have]
+    want = MBUS[code][1]
+    if not have or want in have:
+        return want
+    for alt in PIX_ALT.get(MBUS[code][2], []):
+        if alt in have:
+            return alt
+    return want
+
+
+def modes(cam):
+    """[(w, h, [fps...])] largest first."""
+    code = MBUS[mbus_of(cam)][0]
+    _, out = run(["v4l2-ctl", "-d", cam.node, "--list-subdev-framesizes",
+                  "pad=0,code=0x%x" % code])
+    sizes = sorted({(int(a), int(b)) for a, b in re.findall(r"Size Range: (\d+)x(\d+)", out)},
+                   key=lambda s: -s[0] * s[1])
+    res = []
+    for w, h in sizes:
+        _, o = run(["v4l2-ctl", "-d", cam.node, "--list-subdev-frameintervals",
+                    "pad=0,width=%d,height=%d,code=0x%x" % (w, h, code)])
+        fps = {round(float(f), 3) for f in re.findall(r"\(([\d.]+) fps\)", o)}
+        res.append((w, h, sorted(fps, reverse=True)))
+    return res
+
+
+def product(cam):
+    m = re.search(r"(\d+-[0-9a-f]{4})$", cam.name)
+    if not m:
+        return ""
+    rc, out = run(["dmesg"])
+    hits = re.findall(re.escape(m.group(1)) + r": Product:\s*([^,\s]+)", out)
+    return hits[-1] if hits else ""
+
+
+# ---------------------------------------------------------------- planning
+def plan(g, req):
+    """req: [(cam entity, w, h, fps)] -> list of dicts with the chosen path per camera."""
+    chosen, used_nodes = [], set()
+    for cam, w, h, fps in req:
+        best = None
+        for p in g.paths(cam):
+            node = p[-1][0]
+            if id(node) in used_nodes:
+                continue
+            hops = {(id(e), o) for e, i, o in p[:-1]}
+            shared = sum(len(hops & c["hops"]) for c in chosen)
+            key = (shared, len(p), NODE_ORDER.get(node.name, 100), node.name)
+            if best is None or key < best[0]:
+                best = (key, p, hops)
+        if best is None:
+            die("%s: no free capture node reachable" % cam.name)
+        used_nodes.add(id(best[1][-1][0]))
+        chosen.append({"cam": cam, "w": w, "h": h, "fps": fps, "path": best[1],
+                       "hops": best[2], "node": best[1][-1][0]})
+    # stream ids: on a source pad used by several cameras, number them 0, 1, ...
+    users = {}
+    for c in chosen:
+        for e, i, o in c["path"][:-1]:
+            users.setdefault((id(e), o), []).append(c)
+    for c in chosen:
+        sid, c["streams"] = 0, []
+        for e, i, o in c["path"][:-1]:
+            sin = sid
+            sid = users[(id(e), o)].index(c) if len(users[(id(e), o)]) > 1 else 0
+            c["streams"].append((sin, sid))
+    return chosen
+
+
+def bandwidth(chosen):
+    """Print data rate per receiver; return list of problems."""
+    probs, per = [], {}
+    for c in chosen:
+        bpp = MBUS[mbus_of(c["cam"])][2]
+        c["gbps"] = c["w"] * c["h"] * bpp * c["fps"] / 1e9
+        per.setdefault(c["node"].media, []).append(c)
+    for m, cs in per.items():
+        tot = sum(c["gbps"] for c in cs)
+        cap = RECEIVER_GBPS.get(m.driver)
+        print("  receiver %s (%s): %.2f Gbit/s%s" % (m.dev, m.driver, tot,
+              " of %.1f max" % cap if cap else ""))
+        if cap and tot > cap:
+            probs.append("%s: %.2f Gbit/s is more than the receiver takes (%.1f)" % (m.dev, tot, cap))
+        elif cap and len(cs) > 1 and tot > cap / 2:
+            probs.append("%s: %d cameras share one receiver at %.2f Gbit/s; lines may be "
+                         "dropped (use a 2-port setup or lower fps)" % (m.dev, len(cs), tot))
+    return probs
+
+
+# ---------------------------------------------------------------- apply
+def mc(media, *args):
+    rc, out = run(["media-ctl", "-d", media.dev] + list(args))
+    if rc:
+        raise RuntimeError("media-ctl %s: %s" % (" ".join(args), out.strip()))
+
+
+def apply(g, chosen):
+    used_links = set()
+    routes = {}
+    for c in chosen:
+        code = mbus_of(c["cam"])
+        p = c["path"]
+        for k, (e, i, o) in enumerate(p[:-1]):
+            nxt, nin = p[k + 1][0], p[k + 1][1]
+            used_links.add((id(e), o, id(nxt), nin))
+            if e.routing and i is not None:
+                sin, sout = c["streams"][k]
+                routes.setdefault(id(e), (e, []))[1].append("%d/%d -> %d/%d [1]" % (i, sin, o, sout))
+    # 1. links: enable the ones on the paths, disable other links into capture nodes
+    for m in g.medias:
+        for e in m.ents.values():
+            for p in e.pads.values():
+                if not p.source:
+                    continue
+                for name, rpad, flags in p.links:
+                    r = m.ents.get(name)
+                    if not r or "IMMUTABLE" in flags:
+                        continue
+                    want = (id(e), p.idx, id(r), rpad) in used_links
+                    if want and "ENABLED" not in flags:
+                        mc(m, "-l", '"%s":%d -> "%s":%d [1]' % (e.name, p.idx, r.name, rpad))
+                    elif not want and "ENABLED" in flags and (r.video or SKIP_ENTITY.match(r.name)):
+                        mc(m, "-l", '"%s":%d -> "%s":%d [0]' % (e.name, p.idx, r.name, rpad))
+    # 2. routes on every entity with routing on a path
+    for e, rs in routes.values():
+        mc(e.media, "-R", '"%s" [%s]' % (e.name, ", ".join(rs)))
+    # 3. formats, camera first, then every pad along the path
+    for c in chosen:
+        code = mbus_of(c["cam"])
+        f = "[fmt:%s/%dx%d field:none]" % (code, c["w"], c["h"])
+        p = c["path"]
+        for k, (e, i, o) in enumerate(p[:-1]):
+            sin, sout = c["streams"][k]
+            for pad, sid in ((i, sin), (o, sout)):
+                if pad is None or not e.node:  # no subdev node: the driver sets it itself
+                    continue
+                ref = '"%s":%d' % (e.name, pad) + ("/%d" % sid if e.routing else "")
+                mc(e.media, "-V", ref + " " + f)
+        pix = c["pix"] = pixfmt(c["node"], code)
+        rc, out = run(["v4l2-ctl", "-d", c["node"].node, "--set-fmt-video=width=%d,height=%d,"
+                       "pixelformat=%s" % (c["w"], c["h"], pix)])
+        if rc:
+            raise RuntimeError("%s: %s" % (c["node"].node, out.strip()))
+        # 4. frame rate on the camera
+        run(["v4l2-ctl", "-d", c["cam"].node, "--set-subdev-fps", "pad=0,fps=%g" % c["fps"]])
+        _, out = run(["v4l2-ctl", "-d", c["cam"].node, "--get-subdev-fps", "pad=0"])
+        m = re.search(r"([\d.]+) \(", out)
+        c["fps_set"] = float(m.group(1)) if m else c["fps"]
+
+
+# ---------------------------------------------------------------- commands
+def cmd_ls(g):
+    cams = g.cameras()
+    if not cams:
+        die("no camera found")
+    # paths as used when all cameras run together
+    md = {id(c): modes(c) for c in cams}
+    chosen = {id(c["cam"]): c for c in plan(g, [(c, md[id(c)][0][0], md[id(c)][0][1],
+                                                  md[id(c)][0][2][0]) for c in cams])}
+    for n, cam in enumerate(cams):
+        prod = product(cam)
+        print("cam%d  %s%s" % (n, cam.name, "  " + prod if prod else ""))
+        p = chosen[id(cam)]["path"]
+        print("      " + " -> ".join(e.name for e, i, o in p[:-1]) + " -> " + p[-1][0].node)
+        for w, h, fps in md[id(cam)]:
+            print("      %5dx%-5d %s fps" % (w, h, " ".join("%g" % f for f in fps)))
+
+
+def parse_req(g, args):
+    cams = g.cameras()
+    if not args:  # no camera given: every camera, largest size, top fps
+        args = ["cam%d" % n for n in range(len(cams))]
+    req, i = [], 0
+    while i < len(args):
+        m = re.match(r"cam(\d+)$", args[i])
+        if not m:
+            die("expected camN, got '%s'" % args[i])
+        n = int(m.group(1))
+        if n >= len(cams):
+            die("cam%d not found (have %d camera%s, see 'tn ls')" % (n, len(cams), "" if len(cams) == 1 else "s"))
+        cam, i = cams[n], i + 1
+        md = modes(cam)
+        w, h = md[0][0], md[0][1]
+        if i < len(args) and re.match(r"\d+x\d+$", args[i]):
+            w, h = map(int, args[i].split("x"))
+            i += 1
+        sizes = {(a, b): f for a, b, f in md}
+        if (w, h) not in sizes:
+            die("cam%d (%s): no %dx%d; sizes: %s" % (n, cam.name, w, h,
+                ", ".join("%dx%d" % s for s in sizes)))
+        fps = sizes[(w, h)][0]
+        if i < len(args) and re.match(r"[\d.]+$", args[i]):
+            fps = float(args[i])
+            i += 1
+            if fps not in sizes[(w, h)]:
+                die("cam%d (%s) %dx%d: no %g fps; fps: %s" % (n, cam.name, w, h, fps,
+                    " ".join("%g" % f for f in sizes[(w, h)])))
+        fast = i < len(args) and args[i] == "fps"
+        if fast:
+            i += 1
+        if any(r[0] is cam for r in req):
+            die("cam%d given twice" % n)
+        req.append((cam, w, h, fps, fast))
+    if not req:
+        die("no camera found")
+    return req
+
+
+def setup(g, req, force):
+    chosen = plan(g, [r[:4] for r in req])
+    for c, r in zip(chosen, req):
+        c["fast"] = r[4]
+    for k, c in enumerate(chosen):
+        print("cam%d %s %dx%d@%g -> %s" % (g.cameras().index(c["cam"]), c["cam"].name,
+              c["w"], c["h"], c["fps"], c["node"].node))
+    probs = bandwidth(chosen)
+    for p in probs:
+        print("  WARNING: " + p)
+    if probs and any("more than" in p for p in probs) and not force:
+        die("refusing (add -f to try anyway)")
+    try:
+        apply(g, chosen)
+    except RuntimeError as e:
+        die("setup failed: %s\n(a camera already streaming? stop it first)" % e)
+    for c in chosen:
+        if c["fast"]:  # remember the exposure settings to put them back at exit
+            _, out = run(["v4l2-ctl", "-d", c["cam"].node, "-C", "exposure_mode,exposure"])
+            c["saved"] = dict(re.findall(r"(exposure_mode|exposure): (\d+)", out))
+    if any(c["fast"] for c in chosen):
+        try:
+            tune(chosen)
+        except BaseException:  # Ctrl+C while tuning: put the exposure back
+            restore(chosen)
+            raise
+    return chosen
+
+
+def restore(chosen):
+    """Put back the exposure settings changed for 'fps' cameras."""
+    for c in chosen:
+        sv = c.get("saved")
+        if sv and "exposure_mode" in sv and "exposure" in sv:
+            run(["v4l2-ctl", "-d", c["cam"].node, "-c", "exposure=" + sv["exposure"]])
+            run(["v4l2-ctl", "-d", c["cam"].node, "-c", "exposure_mode=" + sv["exposure_mode"]])
+
+
+def stream_all(chosen, secs):
+    """Stream every camera at once for about secs: [(frames, wanted, fps, output)]."""
+    procs = []
+    for c in chosen:
+        n = max(int(c["fps_set"] * secs), 1)
+        procs.append(subprocess.Popen(["v4l2-ctl", "-d", c["node"].node, "--stream-mmap",
+                                       "--stream-count=%d" % n], stdout=subprocess.PIPE,
+                                      stderr=subprocess.STDOUT, text=True))
+    res = []
+    for c, p in zip(chosen, procs):
+        try:
+            out, _ = p.communicate(timeout=secs * 3 + 10)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            out, _ = p.communicate()
+        fps = re.findall(r"([\d.]+) fps", out)
+        res.append((out.count("<"), max(int(c["fps_set"] * secs), 1),
+                    float(fps[-1]) if fps else 0.0, out))
+    return res
+
+
+def tune(chosen):
+    """For cameras marked 'fps': shorten manual exposure until the top fps is reached."""
+    fast = [c for c in chosen if c["fast"]]
+    for c in fast:
+        c["exp"] = int(1e6 / c["fps_set"] / 3)
+    for _ in range(5):
+        for c in fast:
+            run(["v4l2-ctl", "-d", c["cam"].node, "-c", "exposure_mode=0", "-c", "exposure=%d" % c["exp"]])
+        res = stream_all(chosen, 2)
+        slow = []
+        for c, (frames, want, fps, out) in zip(chosen, res):
+            if c["fast"] and fps < c["fps_set"] * 0.97:
+                slow.append(c)
+                c["exp"] = int(c["exp"] * 0.6)
+        if not slow:
+            break
+    for c, (frames, want, fps, out) in zip(chosen, res):
+        if c["fast"]:
+            print("  %s: exposure %d us -> %.1f fps" % (c["cam"].name, c["exp"], fps))
+
+
+def screen_size():
+    """Size of the first connected display, else 1920x1080."""
+    for st in sorted(glob.glob("/sys/class/drm/card*-*/status")):
+        try:
+            if open(st).read().strip() != "connected":
+                continue
+            m = re.match(r"(\d+)x(\d+)", open(os.path.join(os.path.dirname(st), "modes")).readline())
+            if m:
+                return int(m.group(1)), int(m.group(2))
+        except OSError:
+            pass
+    return 1920, 1080
+
+
+def layout(chosen, sw, sh):
+    """Grid with the largest total picture area: [(x, y, w, h)] per camera."""
+    n, best = len(chosen), None
+    for cols in range(1, n + 1):
+        rows = -(-n // cols)
+        cw, ch = sw // cols, sh // rows
+        tiles, area = [], 0
+        for k, c in enumerate(chosen):
+            s = min(cw / c["w"], ch / c["h"])
+            w, h = int(c["w"] * s) // 2 * 2, int(c["h"] * s) // 2 * 2
+            r, col = divmod(k, cols)
+            tiles.append((col * cw + (cw - w) // 2, r * ch + (ch - h) // 2, w, h))
+            area += w * h
+        if best is None or area >= best[0]:  # tie: more columns (side by side)
+            best = (area, tiles)
+    return best[1]
+
+
+def cmd_show(g, chosen):
+    os.environ.setdefault("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
+    os.environ.setdefault("WAYLAND_DISPLAY", "wayland-0")
+    import gi
+    gi.require_version("Gst", "1.0")
+    from gi.repository import Gst, GLib
+    Gst.init(None)
+    sw, sh = screen_size()
+    tiles = layout(chosen, sw, sh)
+    # latency: give the mixer time for a camera's frame to be scaled, else it is dropped
+    desc = "compositor name=m background=black latency=200000000"
+    for k, (x, y, w, h) in enumerate(tiles):
+        desc += " sink_%d::xpos=%d sink_%d::ypos=%d" % (k, x, k, y)
+    desc += " ! video/x-raw,format=BGRx,width=%d,height=%d,framerate=30/1" % (sw, sh)
+    # fps labels on the final screen image, one per camera at its tile corner
+    for k, (x, y, w, h) in enumerate(tiles):
+        desc += (' ! textoverlay name=txt%d font-desc="Sans 14" halignment=left valignment=top'
+                 ' deltax=%d deltay=%d shaded-background=true' % (k, x + 8, y + 8))
+    desc += " ! waylandsink sync=false fullscreen=true"
+    for k, c in enumerate(chosen):
+        pix = GST_FMT.get(c["pix"], c["pix"])
+        # do-timestamp: the receiver reports a wrong frame rate, so stamp frames when they arrive
+        desc += (" v4l2src name=src%d device=%s do-timestamp=true"
+                 " ! video/x-raw,format=%s,width=%d,height=%d" % (k, c["node"].node, pix, c["w"], c["h"]))
+        # leaky queue: the screen drops frames it can't keep up with, the camera never waits
+        desc += (" ! queue leaky=downstream max-size-buffers=1 ! videoconvertscale n-threads=4"
+                 " ! video/x-raw,format=BGRx,width=%d,height=%d ! m.sink_%d" % (tiles[k][2], tiles[k][3], k))
+    if os.environ.get("TN_DEBUG"):
+        print(desc)
+    pipe = Gst.parse_launch(desc)
+
+    names = ["cam%d" % g.cameras().index(c["cam"]) for c in chosen]
+    count = [0] * len(chosen)
+
+    def counter(k):
+        def probe(pad, info):
+            count[k] += 1
+            return Gst.PadProbeReturn.OK
+        return probe
+
+    for k in range(len(chosen)):
+        pipe.get_by_name("src%d" % k).get_static_pad("src").add_probe(
+            Gst.PadProbeType.BUFFER, counter(k))
+    last = [time.time()]
+
+    def report():
+        now = time.time()
+        dt, last[0] = now - last[0], now
+        line = []
+        for k, c in enumerate(chosen):
+            fps = count[k] / dt
+            count[k] = 0
+            txt = "%s %dx%d  %.1f fps" % (names[k], c["w"], c["h"], fps)
+            pipe.get_by_name("txt%d" % k).set_property("text", txt)
+            line.append(txt)
+        print("   ".join(line), flush=True)
+        return True
+
+    loop = GLib.MainLoop()
+
+    def on_msg(bus, msg):
+        if msg.type == Gst.MessageType.ERROR:
+            err, dbg = msg.parse_error()
+            print("tn: %s" % err.message, file=sys.stderr)
+            loop.quit()
+        elif msg.type == Gst.MessageType.EOS:
+            loop.quit()
+
+    def on_int():
+        pipe.send_event(Gst.Event.new_eos())
+        GLib.timeout_add(3000, loop.quit)
+        return False
+
+    bus = pipe.get_bus()
+    bus.add_signal_watch()
+    bus.connect("message", on_msg)
+    try:
+        from gi.repository import GLibUnix
+        GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, 2, on_int)
+    except ImportError:  # older PyGObject
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 2, on_int)
+    GLib.timeout_add(1000, report)
+    print("showing, Ctrl+C to stop")
+    pipe.set_state(Gst.State.PLAYING)
+    loop.run()
+    pipe.set_state(Gst.State.NULL)
+
+
+def main():
+    a = sys.argv[1:]
+    if a and a[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    force = "-f" in a
+    a = [x for x in a if x != "-f"]
+    g = Graph()
+    if not g.medias:
+        die("no media device (camera driver loaded?)")
+    if a and a[0] == "ls":
+        cmd_ls(g)
+        return
+    act = "show"
+    if a and a[0] == "set":
+        act, a = a[0], a[1:]
+    chosen = setup(g, parse_req(g, a), force)
+    if act == "set":
+        return
+    try:
+        cmd_show(g, chosen)
+    finally:
+        restore(chosen)
+
+
+if __name__ == "__main__":
+    main()
